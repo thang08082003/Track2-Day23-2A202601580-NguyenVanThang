@@ -35,13 +35,74 @@ LOG = pathlib.Path("reports/failover-events.jsonl")
 
 
 def emit(**kw):
-    """TODO: append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
-    raise NotImplementedError
+    """Append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), **kw}
+    with LOG.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    print("FAILOVER", json.dumps(rec))
+    return rec
+
+
+def state_of(region: str) -> dict:
+    """/v1/state của 1 region — CHỈ mang tính thông tin, lỗi ở đây không được abort failover."""
+    try:
+        r = httpx.get(f"{URL[region]}/v1/state", timeout=3.0)
+        return r.json()
+    except Exception as e:
+        return {"region": region, "error": type(e).__name__}
 
 
 def failover(target: str, backend: str, wait: float) -> dict:
-    """TODO: 5 bước ở trên, đúng thứ tự."""
-    raise NotImplementedError
+    """5 bước ở trên, đúng thứ tự."""
+    primary = "a" if target == "b" else "b"
+
+    # 1_verify_target
+    before = state_of(target)
+    emit(step="1_verify_target", target=target, state=before)
+
+    # 2_restore_snapshot
+    meta = snapshot.get(target, backend)
+    rpo = snapshot.rpo(pathlib.Path(f"state/region-{primary}/vectors.sqlite"),
+                        pathlib.Path(f"state/region-{target}/vectors.sqlite"))
+    emit(step="2_restore_snapshot", target=target, backend=backend,
+         embed_model_version=meta.get("embed_model_version"),
+         rpo_seconds=rpo["rpo_seconds"], docs_lost=rpo["docs_lost"])
+
+    # 3_scale_pool
+    pool_state_file = pathlib.Path(f"state/region-{target}/pool_state")
+    pool_state_file.parent.mkdir(parents=True, exist_ok=True)
+    pool_state_file.write_text("full")
+    emit(step="3_scale_pool", target=target, pool_state="full")
+
+    # 4_wait_ready
+    deadline = time.time() + wait
+    poll = max(0.05, min(0.5, wait / 10))
+    ready = False
+    while time.time() < deadline:
+        try:
+            r = httpx.get(f"{URL[target]}/readyz", timeout=2.0)
+            if r.status_code == 200:
+                ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(poll)
+    emit(step="4_wait_ready", target=target, ready=ready)
+
+    if not ready:
+        emit(step="abort", target=target, reason="target khong ready trong wait window")
+        return {"ok": False, "cutover": False, "target": target, "primary": primary,
+                "rpo_seconds": rpo["rpo_seconds"], "docs_lost": rpo["docs_lost"],
+                "reason": "target_not_ready"}
+
+    # 5_dns_cutover — CHỈ đến đây khi target đã thật sự ready
+    pathlib.Path("edge/active_region").write_text(target)
+    emit(step="5_dns_cutover", target=target)
+
+    return {"ok": True, "cutover": True, "target": target, "primary": primary,
+            "restore_meta": meta, "rpo_seconds": rpo["rpo_seconds"],
+            "docs_lost": rpo["docs_lost"], "verify_target_state": before}
 
 
 if __name__ == "__main__":

@@ -29,13 +29,48 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
+    try:
+        r = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+        body = r.json()
+        if r.status_code == 200 and body.get("ready"):
+            return True, "ok"
+        return False, ",".join(body.get("reasons", [])) or f"http_{r.status_code}"
+    except Exception as e:
+        return False, type(e).__name__
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Vòng lặp poll + phát hiện transition + ghi JSONL."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state = {r: {"status": "HEALTHY", "fails": 0} for r in URL}
+    end = time.time() + duration
+    with out.open("a") as f:
+        while time.time() < end:
+            for region in URL:
+                ok, reason = probe(region, timeout)
+                st = state[region]
+                if ok:
+                    st["fails"] = 0
+                    if st["status"] != "HEALTHY":
+                        st["status"] = "HEALTHY"
+                        rec = {"ts": time.time(), "event": "state_change", "region": region,
+                               "to": "HEALTHY", "reason": reason, "interval_s": interval,
+                               "threshold": threshold, "consecutive_fails": 0}
+                        f.write(json.dumps(rec) + "\n")
+                        f.flush()
+                        print("HEALTH", json.dumps(rec))
+                else:
+                    st["fails"] += 1
+                    if st["fails"] >= threshold and st["status"] != "UNHEALTHY":
+                        st["status"] = "UNHEALTHY"
+                        rec = {"ts": time.time(), "event": "state_change", "region": region,
+                               "to": "UNHEALTHY", "reason": reason, "interval_s": interval,
+                               "threshold": threshold, "consecutive_fails": st["fails"]}
+                        f.write(json.dumps(rec) + "\n")
+                        f.flush()
+                        print("HEALTH", json.dumps(rec))
+            time.sleep(interval)
 
 
 if __name__ == "__main__":
